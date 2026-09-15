@@ -10,7 +10,7 @@ import sys
 import threading
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from utils import atomic_replace, fast_safe_load
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 # re-parse + ASCII sweep re-run each time (Bitwarden's own cache only saves the network call).
 _APPLIED_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
+# Expansion bases keep repeated dotenv reloads idempotent. A file change starts a new base.
+_DOTENV_EXPANSION_BASES: dict[str, tuple[int, int, dict[str, str]]] = {}
 
 # Behavioral routing keys a parent Hermes process injects into child env that silently redirect a profile
 # onto the wrong provider path; these — and ONLY these — are scrubbed at startup when absent from the
@@ -234,16 +236,72 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
-def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+def _dotenv_expansion_context(path: Path) -> tuple[dict[str, str | None], dict[str, str]]:
+    """Return stable values for keys defined by *path* and the live environment snapshot."""
     try:
-        # utf-8-sig strips a leading BOM (PowerShell 5.1 / Notepad); plain utf-8 would keep U+FEFF on the
-        # first key name and silently drop it from os.environ under its canonical name.
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8-sig")
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        signature = (0, 0)
+    path_key = str(path.resolve())
+    cached = _DOTENV_EXPANSION_BASES.get(path_key)
+    if cached is None or cached[:2] != signature:
+        base = dict(os.environ)
+        _DOTENV_EXPANSION_BASES[path_key] = (*signature, base)
+    else:
+        base = cached[2]
+    try:
+        defined = dotenv_values(dotenv_path=path, interpolate=False, encoding="utf-8-sig")
     except UnicodeDecodeError:
-        raw = path.read_bytes()  # strip the BOM by hand: utf-8-sig can't once we decode latin-1
+        raw = path.read_bytes()
         if raw.startswith(codecs.BOM_UTF8):
-            raw = raw[len(codecs.BOM_UTF8) :]
-        load_dotenv(stream=io.StringIO(raw.decode("latin-1")), override=override)
+            raw = raw[len(codecs.BOM_UTF8):]
+        defined = dotenv_values(stream=io.StringIO(raw.decode("latin-1")), interpolate=False)
+    return {key: base.get(key) for key in defined if key}, base
+
+
+def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    if not override:
+        try:
+            # utf-8-sig strips a leading BOM (PowerShell 5.1 / Notepad); plain utf-8 would keep U+FEFF on the
+            # first key name and silently drop it from os.environ under its canonical name.
+            load_dotenv(dotenv_path=path, override=False, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            raw = path.read_bytes()  # strip the BOM by hand: utf-8-sig can't once we decode latin-1
+            if raw.startswith(codecs.BOM_UTF8):
+                raw = raw[len(codecs.BOM_UTF8) :]
+            load_dotenv(stream=io.StringIO(raw.decode("latin-1")), override=False)
+        _sanitize_loaded_credentials()  # httpx encodes headers as ASCII
+        return
+
+    expansion_keys, _ = _dotenv_expansion_context(path)
+    previous = {key: os.environ.get(key) for key in expansion_keys}
+    succeeded = False
+    try:
+        # Resolve references against the environment present on the first load of this file, not against
+        # values produced by an earlier reload. This makes standard self-referential PATH assignments safe.
+        for key, value in expansion_keys.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        try:
+            # utf-8-sig strips a leading BOM (PowerShell 5.1 / Notepad); plain utf-8 would keep U+FEFF on the
+            # first key name and silently drop it from os.environ under its canonical name.
+            load_dotenv(dotenv_path=path, override=override, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            raw = path.read_bytes()  # strip the BOM by hand: utf-8-sig can't once we decode latin-1
+            if raw.startswith(codecs.BOM_UTF8):
+                raw = raw[len(codecs.BOM_UTF8) :]
+            load_dotenv(stream=io.StringIO(raw.decode("latin-1")), override=override)
+        succeeded = True
+    finally:
+        if not succeeded:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
     _sanitize_loaded_credentials()  # httpx encodes headers as ASCII
 
 
