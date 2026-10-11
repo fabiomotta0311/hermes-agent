@@ -1,18 +1,10 @@
-"""Only once/session/always count as consent.
+"""Only canonical once/session/always strings count as consent at the final gate.
 
-The approval gate used to be a deny-list: it refused "deny", ``None`` and "timeout" and treated
-every other value as a yes. The local CLI prompt is safe either way because
-``prompt_dangerous_approval`` normalizes keystrokes through a lookup table, but two paths hand
-their answer straight through to ``grant``:
-
-* the gateway round-trip (``_await_gateway_decision``), an inter-process message, and
-* third-party approval transport plugins.
-
-So a client that starts sending ``{"choice": "approve"}`` after an upgrade, a truncated payload, or
-a plugin bug read as consent and the command ran.
-
-These tests pin the allow-list in ``tools.approval._human_decision.grant`` and the boundary
-normalization in ``_canonical_choice`` that keeps real platform answers working.
+Gateway/TUI resolver answers and direct embedding callbacks need this fail-closed
+boundary. Host-owned approval transports already validate allowed choices and request
+binding, so this is defense in depth for transport plugins, not their first validator.
+Cosmetic spelling is normalized here; WhatsApp's legacy Approve button is translated
+at its own ingress. Commands below are detector input only, never executed.
 """
 
 from __future__ import annotations
@@ -27,8 +19,7 @@ from tools.terminal_tool import set_approval_callback
 
 DANGEROUS = "rm -rf /tmp/approval-allowlist-testdir"
 
-# Values a gateway client or transport plugin could plausibly send that are NOT consent. Every one
-# of these executed the command while the gate was a deny-list.
+# Values an unvalidated resolver or embedding callback could send that are NOT consent.
 NOT_CONSENT = [
     "yes",
     "ok",
@@ -40,19 +31,12 @@ NOT_CONSENT = [
     "denied",       # near-miss on the refusal word
 ]
 
-# Spellings normalized onto the canonical vocabulary BEFORE the allow-list runs, rather than
-# widening it. Case and whitespace are cosmetic. The affirmative aliases are the set the API server
-# already applies (``gateway/platforms/api_server_runs.py::_APPROVAL_CHOICE_ALIASES``); the
-# WhatsApp Cloud Approve button sends "approve" verbatim.
+# Cosmetic normalization does not introduce new semantic consent words.
 ALIASES_TO_CANONICAL = {
     "ONCE": "once",
     "once ": "once",
     "  Session  ": "session",
     "ALWAYS": "always",
-    "approve": "once",      # WhatsApp Cloud button payload
-    "Approve": "once",
-    "approved": "once",
-    "allow": "once",
 }
 
 
@@ -91,6 +75,78 @@ def _drive_gateway(monkeypatch, answer):
         lambda *a, **k: {"resolved": True, "choice": answer, "reason": None},
     )
     return check_all_command_guards(DANGEROUS, "local")
+
+
+@pytest.mark.parametrize("answer", [[], {}, ["once"], {"choice": "once"}, 1, True, b"once"])
+@pytest.mark.parametrize("surface", ["gateway", "callback"])
+def test_non_string_answers_fail_closed(monkeypatch, answer, surface):
+    if surface == "gateway":
+        result = _drive_gateway(monkeypatch, answer)
+    else:
+        set_approval_callback(lambda *a, **k: answer)
+        result = check_all_command_guards(DANGEROUS, "local")
+    assert result["approved"] is False
+    assert result["outcome"] == "unrecognized_answer"
+    assert result["user_consent"] is False
+    assert not any(approval_module._session_approved.values())
+    assert not approval_module._permanent_approved
+
+
+@pytest.mark.parametrize("surface", ["gateway", "callback"])
+def test_rejected_payload_is_not_logged(monkeypatch, caplog, surface):
+    secret = "sk-test-invalid-approval-secret-sentinel"
+    if surface == "gateway":
+        result = _drive_gateway(monkeypatch, secret)
+    else:
+        set_approval_callback(lambda *a, **k: secret)
+        result = check_all_command_guards(DANGEROUS, "local")
+    assert result["approved"] is False
+    assert result["outcome"] == "unrecognized_answer"
+    assert "unrecognized approval answer" in caplog.text
+    assert secret not in caplog.text
+    assert all(secret not in repr(record.args) for record in caplog.records)
+
+
+def test_whatsapp_tap_round_trip_is_one_shot(monkeypatch, tmp_path):
+    """Real adapter -> resolver -> waiting guard; only network delivery is replaced."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from gateway.config import PlatformConfig
+    from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+
+    session = "consent-integration"
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setenv("HERMES_SESSION_KEY", session)
+    adapter = WhatsAppCloudAdapter(PlatformConfig(extra={"dm_policy": "allowlist", "allow_from": ["15551234567"]}))
+    adapter._reply_best_effort = AsyncMock()
+    decisions = iter(["approve", "deny"])
+    prompts = []
+
+    def notify(data):
+        prompts.append(data)
+        adapter._exec_approval_state["integration"] = session
+        choice = next(decisions)
+        raw = {"from": "15551234567", "type": "interactive", "interactive": {
+            "type": "button_reply", "button_reply": {"id": f"appr:integration:{choice}", "title": choice}
+        }}
+        assert asyncio.run(adapter._dispatch_interactive_reply(raw, {})) is True
+        return True
+
+    approval_module.register_gateway_notify(session, notify)
+    try:
+        result = check_all_command_guards(DANGEROUS, "local")
+        assert result["approved"] is True
+        assert not any(approval_module._session_approved.values())
+        assert not approval_module._permanent_approved
+        assert not (tmp_path / "hermes_test" / "config.yaml").exists()
+        second = check_all_command_guards(DANGEROUS, "local")
+        assert second["approved"] is False
+        assert second["outcome"] == "denied"
+        assert len(prompts) == 2
+        assert adapter._reply_best_effort.await_count == 2
+        assert not approval_module.has_blocking_approval(session)
+    finally:
+        approval_module.unregister_gateway_notify(session)
 
 
 class TestGatewayAnswersMustBeConsentWords:
@@ -138,27 +194,21 @@ class TestAliasesNormalizeRatherThanWidenTheAllowList:
         assert result.get("approved") is True, f"{sent!r} should normalize to {canonical!r}"
         assert result.get("user_approved") is True
 
-    def test_whatsapp_approve_tap_still_works(self, monkeypatch):
-        """The WhatsApp Cloud adapter builds an ``appr:<id>:approve`` button payload and hands the
-        literal word "approve" to resolve_gateway_approval, which stores it verbatim as the waiting
-        agent's choice. An allow-list with no normalization refuses it — and the adapter still
-        replies "✅ Approved." to the user, so a refused command looks approved.
-        """
-        result = _drive_gateway(monkeypatch, "approve")
-
-        assert result.get("approved") is True
-        assert result.get("outcome") != "unrecognized_answer"
-
-    def test_approve_maps_to_the_narrowest_scope(self, monkeypatch):
-        """An Approve tap is ONE operation. It must never persist a session or permanent grant."""
-        _drive_gateway(monkeypatch, "approve")
-
-        assert not any(approval_module._session_approved.values()), \
-            "'approve' persisted a session grant — it must map to 'once', not 'session'"
-        assert not approval_module._permanent_approved, "'approve' persisted a permanent grant"
+    @pytest.mark.parametrize("answer", ["approve", "Approve", "approved", "allow"])
+    @pytest.mark.parametrize("surface", ["gateway", "callback"])
+    def test_semantic_aliases_are_not_global_consent(self, monkeypatch, answer, surface):
+        if surface == "gateway":
+            result = _drive_gateway(monkeypatch, answer)
+        else:
+            set_approval_callback(lambda *a, **k: answer)
+            result = check_all_command_guards(DANGEROUS, "local")
+        assert result["approved"] is False
+        assert result["outcome"] == "unrecognized_answer"
+        assert not any(approval_module._session_approved.values())
+        assert not approval_module._permanent_approved
 
     def test_session_spelling_variant_still_persists(self, monkeypatch):
-        """The mirror of the test above: a real 'session' answer must still persist."""
+        """A real 'session' answer must still persist despite rejecting semantic aliases."""
         _drive_gateway(monkeypatch, "  Session  ")
 
         assert any(approval_module._session_approved.values()), \

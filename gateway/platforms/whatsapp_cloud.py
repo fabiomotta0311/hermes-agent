@@ -921,7 +921,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         approval = _optional_module("tools.approval", "[whatsapp_cloud] approval resolver unavailable")
         if approval is None:
             return False
-        count = approval.resolve_gateway_approval(session_key, choice)
+        # The legacy Approve button authorizes one operation, never a persistent grant.
+        count = approval.resolve_gateway_approval(session_key, "once" if choice == "approve" else "deny")
         # A tap after the wait timed out (count == 0) must not claim approval:
         # the command was already denied fail-closed.
         if count:
